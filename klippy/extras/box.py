@@ -373,8 +373,17 @@ class BoxStore:
             "rfid_reserve", "")).strip().strip("\x00").strip()
         if reserve:
             clean["rfid_reserve"] = reserve
+        # A spool is only in one place: the newest link wins.
+        unlinked = []
+        if clean["spoolman_id"] is not None:
+            for other, value in self.data["slots"].items():
+                if (other != str(key)
+                        and value.get("spoolman_id") == clean["spoolman_id"]):
+                    value["spoolman_id"] = None
+                    unlinked.append(other)
         self.data["slots"][str(key)] = clean
         self.save()
+        return unlinked
 
     def clear_profile(self, key):
         if self.data["slots"].pop(str(key), None) is not None:
@@ -778,7 +787,7 @@ class Box:
 
     def _disconnect(self, *args):
         self.change_engine.reset_print_mapping()
-        self.next_print_map = None
+        self.discard_next_print_map("Klipper disconnected")
         self._invalidate_tracking_session()
         self.spoolman_generation += 1
         self.spoolman_tokens.clear()
@@ -956,7 +965,14 @@ class Box:
         return self.store.profile(self._profile_key(slot))
 
     def set_profile(self, slot, profile):
-        self.store.set_profile(self._profile_key(slot), profile)
+        unlinked = self.store.set_profile(self._profile_key(slot), profile)
+        if not unlinked:
+            return
+        labels = {str(self._profile_key(other)): self.slot_label(other)
+                  for other in self.physical_slots + (self.external_slot,)}
+        for key in unlinked:
+            self._info(self.gcode, "Spoolman spool %s unlinked from %s" % (
+                profile["spoolman_id"], labels.get(key, "a disconnected CFS")))
 
     def clear_profile(self, slot):
         self.store.clear_profile(self._profile_key(slot))
@@ -1274,7 +1290,7 @@ class Box:
 
     def cmd_print_start(self, gcmd):
         # A map from BOX_PRINT_MAP that no print used yet is replaced, not merged.
-        self.next_print_map = None
+        self.discard_next_print_map("cleared by BOX_PRINT_START")
         sd = self._print_idle(gcmd)
         info = self._inspect_print(gcmd, sd)
         used = self._used_tools(gcmd.error, info["tools"])
@@ -1290,8 +1306,7 @@ class Box:
         sd._reset_file()
         try:
             sd._load_file(gcmd, info["filename"], check_subdirs=True)
-            self.change_engine.tool_map = mapping
-            self.change_engine.mapping_filename = info["filename"]
+            self._install_print_map(mapping, info["filename"])
             sd.do_resume()
         except Exception as exc:
             sd._reset_file()
@@ -1305,16 +1320,31 @@ class Box:
         mapping = self._parse_print_map(gcmd)
         if not mapping:
             # An empty MAP clears a map an earlier start never used.
-            self.discard_next_print_map()
+            self.discard_next_print_map("cleared by an empty BOX_PRINT_MAP")
             return
         self._print_idle(gcmd)
         self._check_print_targets(gcmd.error, mapping)
         self.next_print_map = (
             mapping, self.reactor.monotonic() + NEXT_PRINT_MAP_TIMEOUT)
-        self._info(gcmd, "Tool map set for the next print")
+        # Kalico logs this reply, so it also records the map in klippy.log.
+        self._info(gcmd, "Tool map set for the next print: %s"
+                   % self._describe_print_map(mapping))
 
-    def discard_next_print_map(self):
-        self.next_print_map = None
+    def discard_next_print_map(self, reason="power-loss recovery"):
+        pending, self.next_print_map = self.next_print_map, None
+        if pending is not None:
+            _klog("dropped the next print's tool map (%s): %s",
+                  reason, self._describe_print_map(pending[0]))
+
+    def _describe_print_map(self, mapping):
+        return "; ".join("T%d -> %s" % (tool, self.slot_label(slot))
+                         for tool, slot in sorted(mapping.items()))
+
+    def _install_print_map(self, mapping, filename, action="using"):
+        self.change_engine.tool_map = mapping
+        self.change_engine.mapping_filename = filename
+        _klog("%s tool map for %s: %s",
+              action, filename, self._describe_print_map(mapping))
 
     def _apply_next_print_map(self, *args):
         """Install a BOX_PRINT_MAP map on the file the next print loaded.
@@ -1322,13 +1352,14 @@ class Box:
         Runs inside the start command, so raising refuses the print before
         Virtual SD schedules its first line. The map is used once either way.
         """
-        pending, self.next_print_map = self.next_print_map, None
+        pending = self.next_print_map
         if pending is None:
             return
         mapping, expires = pending
         if self.reactor.monotonic() > expires:
-            _klog("dropped a BOX_PRINT_MAP map no print used")
+            self.discard_next_print_map("expired before a print loaded")
             return
+        self.next_print_map = None
         sd = self.printer.lookup_object("virtual_sdcard")
         path = sd.current_file.name
         filename = os.path.relpath(path, sd.sdcard_dirname)
@@ -1338,9 +1369,10 @@ class Box:
             self._check_map_tools(error, used, mapping)
             self._check_print_targets(error, mapping)
             self._register_tools(used)
-            self.change_engine.tool_map = mapping
-            self.change_engine.mapping_filename = filename
+            self._install_print_map(mapping, filename)
         except Exception as exc:
+            _klog("dropped the next print's tool map (print refused): %s",
+                  self._describe_print_map(mapping))
             sd._reset_file()
             if isinstance(exc, error):
                 raise
