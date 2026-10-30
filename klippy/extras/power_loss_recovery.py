@@ -816,59 +816,6 @@ class _VirtualSDGCodeProxy:
         return result
 
 
-class _SingleZCompat:
-    """Drop-in replacement for the surface of z_align.py that
-    PowerLossRecovery relies on, for machines with a single conventional
-    (non-closed-loop) Z stepper instead of a synchronized dual-Z system.
-
-    z_align.py's job on dual-Z machines is to home/level two Z motors in
-    lockstep and report a "reference frame" describing that alignment so
-    a recovered print can be validated against it before resuming. None
-    of that applies to a single Z stepper: homing is just G28 Z, "rise"
-    is just a plain Z move, and there is no alignment state to track.
-    """
-
-    def __init__(self, printer):
-        self.printer = printer
-        self.reactor = printer.get_reactor()
-        self.gcode = printer.lookup_object("gcode")
-        self.toolhead = printer.lookup_object("toolhead")
-        self.zmax = float(
-            self.toolhead.get_status(
-                self.reactor.monotonic())["axis_maximum"].z)
-
-    def capture_reference_frame(self):
-        return {"single_z": True}
-
-    def validate_reference_frame(self, frame):
-        if not isinstance(frame, dict):
-            raise ValueError("invalid Z reference frame")
-
-    def start_prepare(self):
-        homed = self.toolhead.get_kinematics().get_status(
-            self.reactor.monotonic())["homed_axes"]
-        return "z" not in homed
-
-    def wait_prepare_complete(self):
-        self.gcode.run_script_from_command("G28 Z")
-        return {"prepared_zmax": self.zmax}
-
-    def perform_blocking_rise(self, target_z, rise_speed,
-                               reference_frame=None):
-        self.gcode.run_script_from_command(
-            "G1 Z%.5f F%.3f" % (target_z, rise_speed * 60.0))
-        self.gcode.run_script_from_command("M400")
-
-    def is_active(self):
-        return False
-
-    def abort_internal(self, reason, motor_off=False):
-        pass
-
-    def invalidate_homing_state(self):
-        pass
-
-
 class PowerLossRecovery:
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -950,10 +897,7 @@ class PowerLossRecovery:
             self.motion_queuing = self.printer.lookup_object("motion_queuing")
             self.gcode_move = self.printer.lookup_object("gcode_move")
             self.print_stats = self.printer.lookup_object("print_stats")
-            z_align = self.printer.lookup_object("z_align", None)
-            self.z_align = (
-                z_align if z_align is not None
-                else _SingleZCompat(self.printer))
+            self.z_align = self.printer.lookup_object("z_align")
             self.motion_mcus = (
                 self.printer.lookup_object("mcu"),
                 self.printer.lookup_object("mcu nozzle_mcu"),
